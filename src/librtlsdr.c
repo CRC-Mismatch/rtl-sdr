@@ -1,6 +1,6 @@
 /*
  * rtl-sdr, turns your Realtek RTL2832 based DVB dongle into a SDR receiver
- * Copyright (C) 2012-2013 by Steve Markgraf <steve@steve-m.de>
+ * Copyright (C) 2012-2014 by Steve Markgraf <steve@steve-m.de>
  * Copyright (C) 2012 by Dimitri Stolnikov <horiz0n@gmx.net>
  *
  * This program is free software: you can redistribute it and/or modify
@@ -39,6 +39,12 @@
 #define LIBUSB_CALL
 #endif
 
+/* libusb < 1.0.9 doesn't have libusb_handle_events_timeout_completed */
+#ifndef HAVE_LIBUSB_HANDLE_EVENTS_TIMEOUT_COMPLETED
+#define libusb_handle_events_timeout_completed(ctx, tv, c) \
+	libusb_handle_events_timeout(ctx, tv)
+#endif
+
 /* two raised to the power of n */
 #define TWO_POW(n)		((double)(1ULL<<(n)))
 
@@ -66,6 +72,26 @@ enum rtlsdr_async_status {
 	RTLSDR_RUNNING
 };
 
+#define FIR_LEN 16
+
+/*
+ * FIR coefficients.
+ *
+ * The filter is running at XTal frequency. It is symmetric filter with 32
+ * coefficients. Only first 16 coefficients are specified, the other 16
+ * use the same values but in reversed order. The first coefficient in
+ * the array is the outer one, the last, the last is the inner one.
+ * First 8 coefficients are 8 bit signed integers, the next 8 coefficients
+ * are 12 bit signed integers. All coefficients have the same weight.
+ *
+ * Default FIR coefficients used for DAB/FM by the Windows driver,
+ * the DVB driver uses different ones
+ */
+static const int fir_default[FIR_LEN] = {
+	-54, -36, -41, -40, -32, -14, 14, 53,	/* 8 bit signed */
+	101, 156, 215, 273, 327, 372, 404, 421	/* 12 bit signed */
+};
+
 struct rtlsdr_dev {
 	libusb_context *ctx;
 	struct libusb_device_handle *devh;
@@ -76,15 +102,19 @@ struct rtlsdr_dev {
 	rtlsdr_read_async_cb_t cb;
 	void *cb_ctx;
 	enum rtlsdr_async_status async_status;
+	int async_cancel;
+	int use_zerocopy;
 	/* rtl demod context */
 	uint32_t rate; /* Hz */
 	uint32_t rtl_xtal; /* Hz */
+	int fir[FIR_LEN];
 	int direct_sampling;
 	/* tuner context */
 	enum rtlsdr_tuner tuner_type;
 	rtlsdr_tuner_iface_t *tuner;
 	uint32_t tun_xtal; /* Hz */
 	uint32_t freq; /* Hz */
+	uint32_t bw;
 	uint32_t offs_freq; /* Hz */
 	int corr; /* ppm */
 	int gain; /* tenth dB */
@@ -95,9 +125,12 @@ struct rtlsdr_dev {
 	int dev_lost;
 	int driver_active;
 	unsigned int xfer_errors;
+	int force_bt;
+	int force_ds;
 };
 
 void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val);
+static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq);
 
 /* generic tuner interface functions, shall be moved to the tuner implementations */
 int e4000_init(void *dev) {
@@ -210,7 +243,20 @@ int r820t_set_freq(void *dev, uint32_t freq) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return r82xx_set_freq(&devt->r82xx_p, freq);
 }
-int r820t_set_bw(void *dev, int bw) { return 0; }
+
+int r820t_set_bw(void *dev, int bw) {
+	int r;
+	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
+
+	r = r82xx_set_bandwidth(&devt->r82xx_p, bw, devt->rate);
+	if(r < 0)
+		return r;
+	r = rtlsdr_set_if_freq(devt, r);
+	if (r)
+		return r;
+	return rtlsdr_set_center_freq(devt, devt->freq);
+}
+
 int r820t_set_gain(void *dev, int gain) {
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
 	return r82xx_set_gain(&devt->r82xx_p, 1, gain);
@@ -268,50 +314,55 @@ typedef struct rtlsdr_dongle {
  */
 static rtlsdr_dongle_t known_devices[] = {
 	{ 0x0bda, 0x2832, "Generic RTL2832U" },
-	{ 0x0bda, 0x2838, "ezcap USB 2.0 DVB-T/DAB/FM dongle" },
+	{ 0x0bda, 0x2838, "Generic RTL2832U OEM" },
+	{ 0x0413, 0x6680, "DigitalNow Quad DVB-T PCI-E card" },
+	{ 0x0413, 0x6f0f, "Leadtek WinFast DTV Dongle mini D" },
+	{ 0x0458, 0x707f, "Genius TVGo DVB-T03 USB dongle (Ver. B)" },
 	{ 0x0ccd, 0x00a9, "Terratec Cinergy T Stick Black (rev 1)" },
 	{ 0x0ccd, 0x00b3, "Terratec NOXON DAB/DAB+ USB dongle (rev 1)" },
-	{ 0x0ccd, 0x00b4, "Terratec NOXON DAB/DAB+ USB dongle (rev 1)" },
-	{ 0x0ccd, 0x00b7, "Terratec NOXON DAB/DAB+ USB dongle (rev 1)" },
-	{ 0x0ccd, 0x00c6, "Terratec NOXON DAB/DAB+ USB dongle (rev 1)" },
+	{ 0x0ccd, 0x00b4, "Terratec Deutschlandradio DAB Stick" },
+	{ 0x0ccd, 0x00b5, "Terratec NOXON DAB Stick - Radio Energy" },
+	{ 0x0ccd, 0x00b7, "Terratec Media Broadcast DAB Stick" },
+	{ 0x0ccd, 0x00b8, "Terratec BR DAB Stick" },
+	{ 0x0ccd, 0x00b9, "Terratec WDR DAB Stick" },
+	{ 0x0ccd, 0x00c0, "Terratec MuellerVerlag DAB Stick" },
+	{ 0x0ccd, 0x00c6, "Terratec Fraunhofer DAB Stick" },
 	{ 0x0ccd, 0x00d3, "Terratec Cinergy T Stick RC (Rev.3)" },
 	{ 0x0ccd, 0x00d7, "Terratec T Stick PLUS" },
 	{ 0x0ccd, 0x00e0, "Terratec NOXON DAB/DAB+ USB dongle (rev 2)" },
 	{ 0x1554, 0x5020, "PixelView PV-DT235U(RN)" },
 	{ 0x15f4, 0x0131, "Astrometa DVB-T/DVB-T2" },
+	{ 0x15f4, 0x0133, "HanfTek DAB+FM+DVB-T" },
 	{ 0x185b, 0x0620, "Compro Videomate U620F"},
 	{ 0x185b, 0x0650, "Compro Videomate U650F"},
 	{ 0x185b, 0x0680, "Compro Videomate U680F"},
+	{ 0x1b80, 0xd393, "GIGABYTE GT-U7300" },
+	{ 0x1b80, 0xd394, "DIKOM USB-DVBT HD" },
+	{ 0x1b80, 0xd395, "Peak 102569AGPK" },
+	{ 0x1b80, 0xd397, "KWorld KW-UB450-T USB DVB-T Pico TV" },
+	{ 0x1b80, 0xd398, "Zaapa ZT-MINDVBZP" },
+	{ 0x1b80, 0xd39d, "SVEON STV20 DVB-T USB & FM" },
+	{ 0x1b80, 0xd3a4, "Twintech UT-40" },
+	{ 0x1b80, 0xd3a8, "ASUS U3100MINI_PLUS_V2" },
+	{ 0x1b80, 0xd3af, "SVEON STV27 DVB-T USB & FM" },
+	{ 0x1b80, 0xd3b0, "SVEON STV21 DVB-T USB & FM" },
+	{ 0x1d19, 0x1101, "Dexatek DK DVB-T Dongle (Logilink VG0002A)" },
+	{ 0x1d19, 0x1102, "Dexatek DK DVB-T Dongle (MSI DigiVox mini II V3.0)" },
+	{ 0x1d19, 0x1103, "Dexatek Technology Ltd. DK 5217 DVB-T Dongle" },
+	{ 0x1d19, 0x1104, "MSI DigiVox Micro HD" },
 	{ 0x1f4d, 0xa803, "Sweex DVB-T USB" },
 	{ 0x1f4d, 0xb803, "GTek T803" },
 	{ 0x1f4d, 0xc803, "Lifeview LV5TDeluxe" },
 	{ 0x1f4d, 0xd286, "MyGica TD312" },
 	{ 0x1f4d, 0xd803, "PROlectrix DV107669" },
-	{ 0x1b80, 0xd398, "Zaapa ZT-MINDVBZP" },
-	{ 0x1b80, 0xd3a4, "Twintech UT-40" },
-	{ 0x1b80, 0xd3a8, "ASUS U3100MINI_PLUS_V2" },
-	{ 0x1d19, 0x1101, "Dexatek DK DVB-T Dongle (Logilink VG0002A)" },
-	{ 0x1d19, 0x1102, "Dexatek DK DVB-T Dongle (MSI DigiVox mini II V3.0)" },
-	{ 0x1d19, 0x1103, "Dexatek Technology Ltd. DK 5217 DVB-T Dongle" },
-	{ 0x1d19, 0x1104, "MSI DigiVox Micro HD" },
-	{ 0x0413, 0x6680, "DigitalNow Quad DVB-T PCI-E card" },
-	{ 0x0413, 0x6f0f, "Leadtek WinFast DTV Dongle mini D" },
-	{ 0x0458, 0x707f, "Genius TVGo DVB-T03 USB dongle (Ver. B)" },
-	{ 0x1b80, 0xd393, "GIGABYTE GT-U7300" },
-	{ 0x1b80, 0xd394, "DIKOM USB-DVBT HD" },
-	{ 0x1b80, 0xd395, "Peak 102569AGPK" },
-	{ 0x1b80, 0xd39d, "SVEON STV20 DVB-T USB & FM" },
-	{ 0x1b80, 0xd3b0, "SVEON STV21 DVB-T USB & FM" },
 };
 
-#define DEFAULT_BUF_NUMBER	32
+#define DEFAULT_BUF_NUMBER	15
 #define DEFAULT_BUF_LENGTH	(16 * 32 * 512)
 
 #define DEF_RTL_XTAL_FREQ	28800000
 #define MIN_RTL_XTAL_FREQ	(DEF_RTL_XTAL_FREQ - 1000)
 #define MAX_RTL_XTAL_FREQ	(DEF_RTL_XTAL_FREQ + 1000)
-
-#define MAX_SAMP_RATE		3200000
 
 #define CTRL_IN		(LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_IN)
 #define CTRL_OUT	(LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_ENDPOINT_OUT)
@@ -319,6 +370,7 @@ static rtlsdr_dongle_t known_devices[] = {
 #define BULK_TIMEOUT	0
 
 #define EEPROM_ADDR	0xa0
+#define EEPROM_SIZE     256
 
 enum usb_reg {
 	USB_SYSCTL		= 0x2000,
@@ -508,7 +560,7 @@ int rtlsdr_demod_write_reg(rtlsdr_dev_t *dev, uint8_t page, uint16_t addr, uint1
 
 void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val)
 {
-	uint8_t r;
+	uint16_t r;
 
 	gpio = 1 << gpio;
 	r = rtlsdr_read_reg(dev, SYSB, GPO, 1);
@@ -522,7 +574,7 @@ void rtlsdr_set_gpio_output(rtlsdr_dev_t *dev, uint8_t gpio)
 	gpio = 1 << gpio;
 
 	r = rtlsdr_read_reg(dev, SYSB, GPD, 1);
-	rtlsdr_write_reg(dev, SYSB, GPO, r & ~gpio, 1);
+	rtlsdr_write_reg(dev, SYSB, GPD, r & ~gpio, 1);
 	r = rtlsdr_read_reg(dev, SYSB, GPOE, 1);
 	rtlsdr_write_reg(dev, SYSB, GPOE, r | gpio, 1);
 }
@@ -532,16 +584,42 @@ void rtlsdr_set_i2c_repeater(rtlsdr_dev_t *dev, int on)
 	rtlsdr_demod_write_reg(dev, 1, 0x01, on ? 0x18 : 0x10, 1);
 }
 
+int rtlsdr_set_fir(rtlsdr_dev_t *dev)
+{
+	uint8_t fir[20];
+
+	int i;
+	/* format: int8_t[8] */
+	for (i = 0; i < 8; ++i) {
+		const int val = dev->fir[i];
+		if (val < -128 || val > 127) {
+			return -1;
+		}
+		fir[i] = val;
+	}
+	/* format: int12_t[8] */
+	for (i = 0; i < 8; i += 2) {
+		const int val0 = dev->fir[8+i];
+		const int val1 = dev->fir[8+i+1];
+		if (val0 < -2048 || val0 > 2047 || val1 < -2048 || val1 > 2047) {
+			return -1;
+		}
+		fir[8+i*3/2] = val0 >> 4;
+		fir[8+i*3/2+1] = (val0 << 4) | ((val1 >> 8) & 0x0f);
+		fir[8+i*3/2+2] = val1;
+	}
+
+	for (i = 0; i < (int)sizeof(fir); i++) {
+		if (rtlsdr_demod_write_reg(dev, 1, 0x1c + i, fir[i], 1))
+				return -1;
+	}
+
+	return 0;
+}
+
 void rtlsdr_init_baseband(rtlsdr_dev_t *dev)
 {
 	unsigned int i;
-
-	/* default FIR coefficients used for DAB/FM by the Windows driver,
-	 * the DVB driver uses different ones */
-	const uint8_t fir_coeff[] = {
-		0xca, 0xdc, 0xd7, 0xd8, 0xe0, 0xf2, 0x0e, 0x35, 0x06, 0x50,
-		0x9c, 0x0d, 0x71, 0x11, 0x14, 0x71, 0x74, 0x19, 0x41, 0xa5,
-	};
 
 	/* initialize USB */
 	rtlsdr_write_reg(dev, USBB, USB_SYSCTL, 0x09, 1);
@@ -564,9 +642,7 @@ void rtlsdr_init_baseband(rtlsdr_dev_t *dev)
 	for (i = 0; i < 6; i++)
 		rtlsdr_demod_write_reg(dev, 1, 0x16 + i, 0x00, 1);
 
-	/* set FIR coefficients */
-	for (i = 0; i < sizeof (fir_coeff); i++)
-		rtlsdr_demod_write_reg(dev, 1, 0x1c + i, fir_coeff[i], 1);
+	rtlsdr_set_fir(dev);
 
 	/* enable SDR mode, disable DAGC (bit 5) */
 	rtlsdr_demod_write_reg(dev, 0, 0x19, 0x05, 1);
@@ -614,7 +690,7 @@ int rtlsdr_deinit_baseband(rtlsdr_dev_t *dev)
 	return r;
 }
 
-int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
+static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
 {
 	uint32_t rtl_xtal;
 	int32_t if_freq;
@@ -938,6 +1014,24 @@ int rtlsdr_get_tuner_gains(rtlsdr_dev_t *dev, int *gains)
 	}
 }
 
+int rtlsdr_set_tuner_bandwidth(rtlsdr_dev_t *dev, uint32_t bw)
+{
+	int r = 0;
+
+	if (!dev || !dev->tuner)
+		return -1;
+
+	if (dev->tuner->set_bw) {
+		rtlsdr_set_i2c_repeater(dev, 1);
+		r = dev->tuner->set_bw(dev, bw > 0 ? bw : dev->rate);
+		rtlsdr_set_i2c_repeater(dev, 0);
+		if (r)
+			return r;
+		dev->bw = bw;
+	}
+	return r;
+}
+
 int rtlsdr_set_tuner_gain(rtlsdr_dev_t *dev, int gain)
 {
 	int r = 0;
@@ -1003,31 +1097,35 @@ int rtlsdr_set_sample_rate(rtlsdr_dev_t *dev, uint32_t samp_rate)
 {
 	int r = 0;
 	uint16_t tmp;
-	uint32_t rsamp_ratio;
+	uint32_t rsamp_ratio, real_rsamp_ratio;
 	double real_rate;
 
 	if (!dev)
 		return -1;
 
-	/* check for the maximum rate the resampler supports */
-	if (samp_rate > MAX_SAMP_RATE)
-		samp_rate = MAX_SAMP_RATE;
+	/* check if the rate is supported by the resampler */
+	if ((samp_rate <= 225000) || (samp_rate > 3200000) ||
+	   ((samp_rate > 300000) && (samp_rate <= 900000))) {
+		fprintf(stderr, "Invalid sample rate: %u Hz\n", samp_rate);
+		return -EINVAL;
+	}
 
 	rsamp_ratio = (dev->rtl_xtal * TWO_POW(22)) / samp_rate;
-	rsamp_ratio &= ~3;
+	rsamp_ratio &= 0x0ffffffc;
 
-	real_rate = (dev->rtl_xtal * TWO_POW(22)) / rsamp_ratio;
+	real_rsamp_ratio = rsamp_ratio | ((rsamp_ratio & 0x08000000) << 1);
+	real_rate = (dev->rtl_xtal * TWO_POW(22)) / real_rsamp_ratio;
 
 	if ( ((double)samp_rate) != real_rate )
 		fprintf(stderr, "Exact sample rate is: %f Hz\n", real_rate);
 
+	dev->rate = (uint32_t)real_rate;
+
 	if (dev->tuner && dev->tuner->set_bw) {
 		rtlsdr_set_i2c_repeater(dev, 1);
-		dev->tuner->set_bw(dev, (int)real_rate);
+		dev->tuner->set_bw(dev, dev->bw > 0 ? dev->bw : dev->rate);
 		rtlsdr_set_i2c_repeater(dev, 0);
 	}
-
-	dev->rate = (uint32_t)real_rate;
 
 	tmp = (rsamp_ratio >> 16);
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x9f, tmp, 2);
@@ -1077,6 +1175,8 @@ int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 
 	if (!dev)
 		return -1;
+
+	if(dev->force_ds) on = 2;
 
 	if (on) {
 		if (dev->tuner && dev->tuner->exit) {
@@ -1145,9 +1245,14 @@ int rtlsdr_get_direct_sampling(rtlsdr_dev_t *dev)
 int rtlsdr_set_offset_tuning(rtlsdr_dev_t *dev, int on)
 {
 	int r = 0;
+	int bw;
 
 	if (!dev)
 		return -1;
+
+	// RTL-SDR-BLOG Hack, enables us to turn on the bias tee by clicking on "offset tuning" in software that doesn't have specified bias tee support.
+	// Offset tuning is not used for R820T devices so it is no problem.
+	rtlsdr_set_gpio(dev, 0, on);
 
 	if ((dev->tuner_type == RTLSDR_TUNER_R820T) ||
 	    (dev->tuner_type == RTLSDR_TUNER_R828D))
@@ -1162,7 +1267,14 @@ int rtlsdr_set_offset_tuning(rtlsdr_dev_t *dev, int on)
 
 	if (dev->tuner && dev->tuner->set_bw) {
 		rtlsdr_set_i2c_repeater(dev, 1);
-		dev->tuner->set_bw(dev, on ? (2 * dev->offs_freq) : dev->rate);
+		if (on) {
+			bw = 2 * dev->offs_freq;
+		} else if (dev->bw > 0) {
+			bw = dev->bw;
+		} else {
+			bw = dev->rate;
+		}
+		dev->tuner->set_bw(dev, bw);
 		rtlsdr_set_i2c_repeater(dev, 0);
 	}
 
@@ -1197,14 +1309,16 @@ static rtlsdr_dongle_t *find_known_device(uint16_t vid, uint16_t pid)
 
 uint32_t rtlsdr_get_device_count(void)
 {
-	int i;
+	int i,r;
 	libusb_context *ctx;
 	libusb_device **list;
 	uint32_t device_count = 0;
 	struct libusb_device_descriptor dd;
 	ssize_t cnt;
 
-	libusb_init(&ctx);
+	r = libusb_init(&ctx);
+	if(r < 0)
+		return 0;
 
 	cnt = libusb_get_device_list(ctx, &list);
 
@@ -1224,7 +1338,7 @@ uint32_t rtlsdr_get_device_count(void)
 
 const char *rtlsdr_get_device_name(uint32_t index)
 {
-	int i;
+	int i,r;
 	libusb_context *ctx;
 	libusb_device **list;
 	struct libusb_device_descriptor dd;
@@ -1232,7 +1346,9 @@ const char *rtlsdr_get_device_name(uint32_t index)
 	uint32_t device_count = 0;
 	ssize_t cnt;
 
-	libusb_init(&ctx);
+	r = libusb_init(&ctx);
+	if(r < 0)
+		return "";
 
 	cnt = libusb_get_device_list(ctx, &list);
 
@@ -1272,7 +1388,9 @@ int rtlsdr_get_device_usb_strings(uint32_t index, char *manufact,
 	uint32_t device_count = 0;
 	ssize_t cnt;
 
-	libusb_init(&ctx);
+	r = libusb_init(&ctx);
+	if(r < 0)
+		return r;
 
 	cnt = libusb_get_device_list(ctx, &list);
 
@@ -1338,14 +1456,20 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 	struct libusb_device_descriptor dd;
 	uint8_t reg;
 	ssize_t cnt;
+	uint8_t buf[EEPROM_SIZE];
 
 	dev = malloc(sizeof(rtlsdr_dev_t));
 	if (NULL == dev)
 		return -ENOMEM;
 
 	memset(dev, 0, sizeof(rtlsdr_dev_t));
+	memcpy(dev->fir, fir_default, sizeof(fir_default));
 
-	libusb_init(&dev->ctx);
+	r = libusb_init(&dev->ctx);
+	if(r < 0){
+		free(dev);
+		return -1;
+	}
 
 	dev->dev_lost = 1;
 
@@ -1448,14 +1572,15 @@ int rtlsdr_open(rtlsdr_dev_t **out_dev, uint32_t index)
 	if (reg == R82XX_CHECK_VAL) {
 		fprintf(stderr, "Found Rafael Micro R828D tuner\n");
 		dev->tuner_type = RTLSDR_TUNER_R828D;
+		goto found;
 	}
 
 	/* initialise GPIOs */
-	rtlsdr_set_gpio_output(dev, 5);
+	rtlsdr_set_gpio_output(dev, 4);
 
 	/* reset tuner before probing */
-	rtlsdr_set_gpio_bit(dev, 5, 1);
-	rtlsdr_set_gpio_bit(dev, 5, 0);
+	rtlsdr_set_gpio_bit(dev, 4, 1);
+	rtlsdr_set_gpio_bit(dev, 4, 0);
 
 	reg = rtlsdr_i2c_read_reg(dev, FC2580_I2C_ADDR, FC2580_CHECK_ADDR);
 	if ((reg & 0x7f) == FC2580_CHECK_VAL) {
@@ -1480,6 +1605,7 @@ found:
 	switch (dev->tuner_type) {
 	case RTLSDR_TUNER_R828D:
 		dev->tun_xtal = R828D_XTAL_FREQ;
+		/* fall-through */
 	case RTLSDR_TUNER_R820T:
 		/* disable Zero-IF mode */
 		rtlsdr_demod_write_reg(dev, 1, 0xb1, 0x1a, 1);
@@ -1493,14 +1619,25 @@ found:
 
 		/* enable spectrum inversion */
 		rtlsdr_demod_write_reg(dev, 1, 0x15, 0x01, 1);
+
 		break;
 	case RTLSDR_TUNER_UNKNOWN:
 		fprintf(stderr, "No supported tuner found\n");
-		rtlsdr_set_direct_sampling(dev, 1);
+		rtlsdr_set_direct_sampling(dev, 2);
 		break;
 	default:
 		break;
 	}
+
+
+    /* Hack to force the Bias T to always be on if we set the IR-Endpoint bit in the EEPROM to 0. Default on EEPROM is 1. */
+	r = rtlsdr_read_eeprom(dev, buf, 0, EEPROM_SIZE);
+    dev->force_bt = (buf[7] & 0x02) ? 0 : 1;
+	if(dev->force_bt) rtlsdr_set_gpio(dev, 0, 1);
+	/* Hack to force direct sampling mode to always be on if we set the remote-enabled bit in the EEPROM to 1. Default on EEPROM is 0. */
+	dev->force_ds = (buf[7] & 0x01) ? 1 : 0;
+	if(dev->force_ds) dev->tuner_type = RTLSDR_TUNER_UNKNOWN;
+
 
 	if (dev->tuner->init)
 		r = dev->tuner->init(dev);
@@ -1512,6 +1649,9 @@ found:
 	return 0;
 err:
 	if (dev) {
+		if (dev->devh)
+			libusb_close(dev->devh);
+
 		if (dev->ctx)
 			libusb_exit(dev->ctx);
 
@@ -1626,12 +1766,64 @@ static int _rtlsdr_alloc_async_buffers(rtlsdr_dev_t *dev)
 			dev->xfer[i] = libusb_alloc_transfer(0);
 	}
 
-	if (!dev->xfer_buf) {
-		dev->xfer_buf = malloc(dev->xfer_buf_num *
-					   sizeof(unsigned char *));
+	if (dev->xfer_buf)
+		return -2;
 
-		for(i = 0; i < dev->xfer_buf_num; ++i)
+	dev->xfer_buf = malloc(dev->xfer_buf_num * sizeof(unsigned char *));
+	memset(dev->xfer_buf, 0, dev->xfer_buf_num * sizeof(unsigned char *));
+
+#if defined(ENABLE_ZEROCOPY) && defined (__linux__) && LIBUSB_API_VERSION >= 0x01000105
+	fprintf(stderr, "Allocating %d zero-copy buffers\n", dev->xfer_buf_num);
+
+	dev->use_zerocopy = 1;
+	for (i = 0; i < dev->xfer_buf_num; ++i) {
+		dev->xfer_buf[i] = libusb_dev_mem_alloc(dev->devh, dev->xfer_buf_len);
+
+		if (dev->xfer_buf[i]) {
+			/* Check if Kernel usbfs mmap() bug is present: if the
+			 * mapping is correct, the buffers point to memory that
+			 * was memset to 0 by the Kernel, otherwise, they point
+			 * to random memory. We check if the buffers are zeroed
+			 * and otherwise fall back to buffers in userspace.
+			 */
+			if (dev->xfer_buf[i][0] || memcmp(dev->xfer_buf[i],
+							  dev->xfer_buf[i] + 1,
+							  dev->xfer_buf_len - 1)) {
+				fprintf(stderr, "Detected Kernel usbfs mmap() "
+						"bug, falling back to buffers "
+						"in userspace\n");
+				dev->use_zerocopy = 0;
+				break;
+			}
+		} else {
+			fprintf(stderr, "Failed to allocate zero-copy "
+					"buffer for transfer %d\nFalling "
+					"back to buffers in userspace\n", i);
+			dev->use_zerocopy = 0;
+			break;
+		}
+	}
+
+	/* zero-copy buffer allocation failed (partially or completely)
+	 * we need to free the buffers again if already allocated */
+	if (!dev->use_zerocopy) {
+		for (i = 0; i < dev->xfer_buf_num; ++i) {
+			if (dev->xfer_buf[i])
+				libusb_dev_mem_free(dev->devh,
+						    dev->xfer_buf[i],
+						    dev->xfer_buf_len);
+		}
+	}
+#endif
+
+	/* no zero-copy available, allocate buffers in userspace */
+	if (!dev->use_zerocopy) {
+		for (i = 0; i < dev->xfer_buf_num; ++i) {
 			dev->xfer_buf[i] = malloc(dev->xfer_buf_len);
+
+			if (!dev->xfer_buf[i])
+				return -ENOMEM;
+		}
 	}
 
 	return 0;
@@ -1656,9 +1848,18 @@ static int _rtlsdr_free_async_buffers(rtlsdr_dev_t *dev)
 	}
 
 	if (dev->xfer_buf) {
-		for(i = 0; i < dev->xfer_buf_num; ++i) {
-			if (dev->xfer_buf[i])
-				free(dev->xfer_buf[i]);
+		for (i = 0; i < dev->xfer_buf_num; ++i) {
+			if (dev->xfer_buf[i]) {
+				if (dev->use_zerocopy) {
+#if defined (__linux__) && LIBUSB_API_VERSION >= 0x01000105
+					libusb_dev_mem_free(dev->devh,
+							    dev->xfer_buf[i],
+							    dev->xfer_buf_len);
+#endif
+				} else {
+					free(dev->xfer_buf[i]);
+				}
+			}
 		}
 
 		free(dev->xfer_buf);
@@ -1674,6 +1875,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 	unsigned int i;
 	int r = 0;
 	struct timeval tv = { 1, 0 };
+	struct timeval zerotv = { 0, 0 };
 	enum rtlsdr_async_status next_status = RTLSDR_INACTIVE;
 
 	if (!dev)
@@ -1683,6 +1885,7 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 		return -2;
 
 	dev->async_status = RTLSDR_RUNNING;
+	dev->async_cancel = 0;
 
 	dev->cb = cb;
 	dev->cb_ctx = ctx;
@@ -1709,11 +1912,22 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 					  (void *)dev,
 					  BULK_TIMEOUT);
 
-		libusb_submit_transfer(dev->xfer[i]);
+		r = libusb_submit_transfer(dev->xfer[i]);
+		if (r < 0) {
+			fprintf(stderr, "Failed to submit transfer %i\n"
+					"Please increase your allowed " 
+					"usbfs buffer size with the "
+					"following command:\n"
+					"echo 0 > /sys/module/usbcore"
+					"/parameters/usbfs_memory_mb\n", i);
+			dev->async_status = RTLSDR_CANCELING;
+			break;
+		}
 	}
 
 	while (RTLSDR_INACTIVE != dev->async_status) {
-		r = libusb_handle_events_timeout(dev->ctx, &tv);
+		r = libusb_handle_events_timeout_completed(dev->ctx, &tv,
+							   &dev->async_cancel);
 		if (r < 0) {
 			/*fprintf(stderr, "handle_events returned: %d\n", r);*/
 			if (r == LIBUSB_ERROR_INTERRUPTED) /* stray signal */
@@ -1733,13 +1947,25 @@ int rtlsdr_read_async(rtlsdr_dev_t *dev, rtlsdr_read_async_cb_t cb, void *ctx,
 
 				if (LIBUSB_TRANSFER_CANCELLED !=
 						dev->xfer[i]->status) {
-					libusb_cancel_transfer(dev->xfer[i]);
+					r = libusb_cancel_transfer(dev->xfer[i]);
+					/* handle events after canceling
+					 * to allow transfer status to
+					 * propagate */
+					libusb_handle_events_timeout_completed(dev->ctx,
+									       &zerotv, NULL);
+					if (r < 0)
+						continue;
+
 					next_status = RTLSDR_CANCELING;
 				}
 			}
 
 			if (dev->dev_lost || RTLSDR_INACTIVE == next_status) {
-				libusb_handle_events_timeout(dev->ctx, &tv);
+				/* handle any events that still need to
+				 * be handled before exiting after we
+				 * just cancelled all transfers */
+				libusb_handle_events_timeout_completed(dev->ctx,
+								       &zerotv, NULL);
 				break;
 			}
 		}
@@ -1760,6 +1986,7 @@ int rtlsdr_cancel_async(rtlsdr_dev_t *dev)
 	/* if streaming, try to cancel gracefully */
 	if (RTLSDR_RUNNING == dev->async_status) {
 		dev->async_status = RTLSDR_CANCELING;
+		dev->async_cancel = 1;
 		return 0;
 	}
 
@@ -1801,4 +2028,30 @@ int rtlsdr_i2c_read_fn(void *dev, uint8_t addr, uint8_t *buf, int len)
 		return rtlsdr_i2c_read(((rtlsdr_dev_t *)dev), addr, buf, len);
 
 	return -1;
+}
+
+int rtlsdr_set_bias_tee(rtlsdr_dev_t *dev, int on)
+{
+	if (!dev)
+		return -1;
+
+	if(dev->force_bt) on = 1; // If force_bt is on from the EEPROM, do not allow bias tee to turn off
+
+	rtlsdr_set_gpio_output(dev, 0);
+	rtlsdr_set_gpio_bit(dev, 0, on);
+
+	return 0;
+}
+
+int rtlsdr_set_gpio(rtlsdr_dev_t *dev, int gpio_pin, int on)
+{
+	if (!dev)
+		return -1;
+
+	if(dev->force_bt) on = 1; // If force_bt is on from the EEPROM, do not allow bias tee to turn off
+
+	rtlsdr_set_gpio_output(dev, gpio_pin);
+	rtlsdr_set_gpio_bit(dev, gpio_pin, on);
+
+	return 1;
 }
